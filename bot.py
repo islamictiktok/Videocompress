@@ -1,59 +1,65 @@
 import os
 import subprocess
-from pyrogram import Client, filters
+import telebot
 
-# قراءة المتغيرات من بيئة Railway
-API_ID = os.environ.get("API_ID")
-API_HASH = os.environ.get("API_HASH")
+# استدعاء التوكن فقط من بيئة Railway
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-
-app = Client(
-    "video_compressor_bot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+bot = telebot.TeleBot(BOT_TOKEN)
 
 def compress_video(input_path, output_path):
-    # استخدام preset أسرع لتسريع الضغط مع الحفاظ على الكفاءة
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-c:v", "libx265",
-        "-preset", "superfast",  # تم التغيير من medium لزيادة سرعة المعالجة
+        "-preset", "superfast",
         "-crf", "30",
         "-c:a", "aac",
         "-b:a", "96k",
         "-movflags", "+faststart",
         output_path
     ]
-    
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     return os.path.exists(output_path) and os.path.getsize(output_path) > 0
 
-@app.on_message(filters.video | filters.document)
-async def handle_video(client, message):
-    # التأكد من أن الملف هو فيديو
-    if message.document and not message.document.mime_type.startswith('video/'):
-        await message.reply("⚠️ أرسل ملفات الفيديو فقط.")
+@bot.message_handler(content_types=['video', 'document'])
+def handle_video(message):
+    # التأكد من أن الملف فيديو إذا تم إرساله كمستند
+    if message.content_type == 'document' and not message.document.mime_type.startswith('video/'):
+        bot.reply_to(message, "⚠️ أرسل ملفات الفيديو فقط.")
         return
 
-    msg = await message.reply("📥 جاري التنزيل بأقصى سرعة...")
+    # التحقق من الحجم (الحد الأقصى 20 ميجابايت عبر Bot API)
+    file_size = message.video.file_size if message.content_type == 'video' else message.document.file_size
+    if file_size > 20 * 1024 * 1024:
+        bot.reply_to(message, "❌ حجم الملف يتجاوز 20 ميجابايت (الحد الأقصى المسموح به للبوتات بدون استخدام حساب شخصي).")
+        return
+
+    msg = bot.reply_to(message, "📥 جاري التنزيل...")
+    
+    input_path = ""
+    output_path = ""
     
     try:
-        # مسار التنزيل
-        file_path = await message.download()
-        original_size = os.path.getsize(file_path) / (1024 * 1024)
+        # الحصول على مسار الملف من سيرفر تيليجرام وتنزيله
+        file_id = message.video.file_id if message.content_type == 'video' else message.document.file_id
+        file_info = bot.get_file(file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
         
-        await msg.edit(f"⚙️ جاري ضغط الفيديو (الحجم الأصلي: {original_size:.2f} MB)...")
+        input_path = f"{file_id}.mp4"
+        output_path = f"{file_id}_compressed.mp4"
         
-        out_path = f"{file_path}_compressed.mp4"
-        success = compress_video(file_path, out_path)
+        with open(input_path, 'wb') as new_file:
+            new_file.write(downloaded_file)
+            
+        original_size = os.path.getsize(input_path) / (1024 * 1024)
+        bot.edit_message_text(f"⚙️ جاري ضغط الفيديو (الحجم الأصلي: {original_size:.2f} MB)...", chat_id=msg.chat.id, message_id=msg.message_id)
+        
+        success = compress_video(input_path, output_path)
         
         if success:
-            new_size = os.path.getsize(out_path) / (1024 * 1024)
+            new_size = os.path.getsize(output_path) / (1024 * 1024)
             saving = (1 - (new_size / original_size)) * 100
             
-            await msg.edit("🚀 جاري الرفع...")
+            bot.edit_message_text("🚀 جاري الرفع...", chat_id=msg.chat.id, message_id=msg.message_id)
             
             caption = (
                 f"✅ تم الضغط بنجاح!\n"
@@ -62,20 +68,19 @@ async def handle_video(client, message):
                 f"🔥 نسبة التوفير: {saving:.1f}%"
             )
             
-            # رفع الفيديو كرسالة فيديو مباشرة
-            await message.reply_video(video=out_path, caption=caption)
-            os.remove(out_path)
+            with open(output_path, 'rb') as video_file:
+                bot.send_video(message.chat.id, video_file, caption=caption, reply_to_message_id=message.message_id)
         else:
-            await msg.edit("❌ فشلت عملية الضغط.")
+            bot.edit_message_text("❌ فشلت عملية الضغط.", chat_id=msg.chat.id, message_id=msg.message_id)
             
     except Exception as e:
-        await msg.edit(f"❌ حدث خطأ: {str(e)}")
+        bot.edit_message_text(f"❌ حدث خطأ: {str(e)}", chat_id=msg.chat.id, message_id=msg.message_id)
         
     finally:
-        # تنظيف الملفات المؤقتة لتجنب امتلاء مساحة السيرفر
-        if 'file_path' in locals() and os.path.exists(file_path):
-            os.remove(file_path)
+        # تنظيف مساحة السيرفر بعد الانتهاء
+        if input_path and os.path.exists(input_path): os.remove(input_path)
+        if output_path and os.path.exists(output_path): os.remove(output_path)
 
 if __name__ == "__main__":
-    print("🤖 البوت يعمل الآن...")
-    app.run()
+    print("🤖 البوت يعمل الآن باستخدام التوكن فقط...")
+    bot.infinity_polling()
